@@ -11,6 +11,7 @@
     <arg name="real_time_factor" default="1.0"/>
     <arg name="gui" default="True"/>
     <arg name="rviz" default="True"/>
+    <arg name="env_config" default="$(env FLIGHTMARE_PATH)/flightpy/configs/vision/config.yaml"/>
 
     <!-- quadrotor simulation -->
     <group ns="$(arg quad_name)">
@@ -23,6 +24,7 @@
             <param name="low_level_controller" value="$(arg low_level_controller)"/>
             <param name="camera_config" value="$(find envsim)/parameters/camera_config.yaml"/>
             <param name="render" value="$(arg render)"/>
+            <param name="env_config" value="$(arg env_config)"/>
         </node>
     </group>
 

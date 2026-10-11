@@ -76,9 +76,12 @@ class AgilePilotNode:
 
         self.data_collection_xrange = [2, 60]
 
-        # make the folder for the epoch
-        self.folder = f"train_set/{int(time.time()*100)}" 
+        # Make the folder for the epoch. The original setup script creates the
+        # parent, but containerized and fresh checkouts should be self-contained.
+        os.makedirs("train_set", exist_ok=True)
+        self.folder = f"train_set/{int(time.time()*100)}"
         os.mkdir(self.folder)
+        rospy.on_shutdown(self.flush_data_log)
 
         self.desiredVel = desVel #self.readVel("velocity.txt") #np.random.uniform(low=2.0, high=3.0)
         print()
@@ -202,6 +205,10 @@ class AgilePilotNode:
         self.got_keypress = 0.0
         self.rgb_img = None
 
+    def flush_data_log(self):
+        if len(self.data_log) > 0:
+            self.data_log.to_csv(self.folder + "/data.csv")
+
     def rgb_callback(self, img):
         self.rgb_img = self.cv_bridge.imgmsg_to_cv2(img, desired_encoding="passthrough")
 
@@ -223,6 +230,9 @@ class AgilePilotNode:
         self.ctr += 1
         self.prevImg = deepcopy(self.last_valid_img)
         img = self.cv_bridge.imgmsg_to_cv2(img_data, desired_encoding="passthrough")
+        if img.size == 0:
+            rospy.logwarn_throttle(5.0, "Ignoring an empty depth frame while the renderer starts")
+            return
         img = np.clip(img/self.depth_im_threshold, 0, 1)
                 
         if self.prevImg is None:
@@ -319,7 +329,10 @@ class AgilePilotNode:
     def obstacle_callback(self, obs_data):
         if self.state is None:
             return
-        self.col = self.if_collide(obs_data.obstacles[0])
+        # State and obstacle callbacks run independently. Keep one state snapshot
+        # for the whole sample so its timestamp, pose, and velocity stay coherent.
+        state = self.state
+        self.col = self.if_collide(obs_data.obstacles[0], state)
         if self.vision_based:
             return
         if self.rgb_img is None:
@@ -335,7 +348,7 @@ class AgilePilotNode:
             self.keyboard_input = ''
 
         command = compute_command_state_based(
-            state=self.state,
+            state=state,
             obstacles=obs_data,
             desiredVel=self.desiredVel,
             rl_policy=self.rl_policy,
@@ -344,49 +357,52 @@ class AgilePilotNode:
         )
         self.publish_command(command)
 
-        if self.state.pos[0] < 0.1:
+        if state.pos[0] < 0.1:
             self.start_time = command.t
-        if self.state.pos[0] >= 60 and self.logged_time_flag == 0:
+        if state.pos[0] >= 60 and self.logged_time_flag == 0:
             file = "timeTaken.dat"
             with open(file, "a") as file:
                 file.write(str(float(command.t - self.start_time))+"\n")
             self.logged_time_flag = 1
         
         # if we exceed the time interval then save the data
-        if (self.state.t - self.t1 > self.time_interval or self.t1 == 0 or self.col) and (self.state.pos[2] > 2.95 or self.init == 1):
+        should_log = (
+            state.t - self.t1 > self.time_interval
+            or self.t1 == 0
+            or (self.col and state.t > self.t1)
+        )
+        if should_log and (state.pos[2] > 2.95 or self.init == 1):
             
             self.init = 1
 
-            if self.state.pos[0] > self.data_collection_xrange[0] and self.state.pos[0] < self.data_collection_xrange[1]:
+            if state.pos[0] > self.data_collection_xrange[0] and state.pos[0] < self.data_collection_xrange[1]:
 
                 # reset the time flag
-                self.t1 = self.state.t
+                self.t1 = state.t
 
                 # Get the current time stamp
-                timestamp = round(self.state.t, 3)  # If you need more hz, you might need to modify this round
+                timestamp = round(state.t, 3)  # If you need more hz, you might need to modify this round
 
                 # Save the image by the name of that instant
                 # np.save(self.folder + f"/im_{timestamp}", self.last_valid_img)
                 cv2.imwrite(f"{self.folder}/{str(timestamp)}.png", (self.last_valid_img*255).astype(np.uint8))
-                cv2.imwrite(f"{self.folder}/{str(timestamp)}_rgb.png", (self.rgb_img*255).astype(np.uint8))
 
                 # Get the collision flag
-                col = self.if_collide(obs_data.obstacles[0])
                 # Append the data frame
                 # @TODO: This needs to be managed better if the number of datapoints exceeds 10,000
                 self.data_log.loc[len(self.data_log)] = [
                     timestamp,
                     self.desiredVel,
-                    self.state.att[0],
-                    self.state.att[1],
-                    self.state.att[2],
-                    self.state.att[3],
-                    self.state.pos[0],
-                    self.state.pos[1],
-                    self.state.pos[2],
-                    self.state.vel[0],
-                    self.state.vel[1],
-                    self.state.vel[2],
+                    state.att[0],
+                    state.att[1],
+                    state.att[2],
+                    state.att[3],
+                    state.pos[0],
+                    state.pos[1],
+                    state.pos[2],
+                    state.vel[0],
+                    state.vel[1],
+                    state.vel[2],
                     command.velocity[0],
                     command.velocity[1],
                     command.velocity[2],
@@ -401,10 +417,10 @@ class AgilePilotNode:
                 self.count += 1
 
         # Save once every 10 instances - writing every instance can be expensive
-        if self.count % 2 == 0 and self.count != 0 or abs(self.state.pos[0] - 20) < 1:
+        if self.count % 2 == 0 and self.count != 0 or abs(state.pos[0] - 20) < 1:
             self.data_log.to_csv(self.folder + "/data.csv")
 
-    def if_collide(self, obs):
+    def if_collide(self, obs, state=None):
         """
         Borrowed and modified from evaluation_node
         """
@@ -413,8 +429,11 @@ class AgilePilotNode:
             np.array([obs.position.x, obs.position.y, obs.position.z])
         )
         margin = dist - obs.scale
+        if state is None:
+            state = self.state
+
         # Ground hit condition
-        if margin < 0 or self.state.pos[2] <= 0.01:
+        if margin < 0 or state.pos[2] <= 0.01:
             hit_obstacle = True
         else:
             hit_obstacle = False

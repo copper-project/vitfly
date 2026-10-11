@@ -125,15 +125,34 @@ def compute_command_vision_based(state, orig_img, prev_img, desiredVel, trained_
 
 # helper function for vectorized expert policy (method_id = 1)
 def find_closest_zero_index(arr):
-    center = np.array(arr.shape) // 2  # find the center point of the array
-    dist_to_center = np.abs(np.indices(arr.shape) - center.reshape(-1, 1, 1)).sum(0)  # calculate distance to center for each element
-    zero_indices = np.argwhere(arr == 0)  # find indices of all zero elements
+    """Return the nearest free waypoint with a stable avoidance-side tie-break.
+
+    The second array axis maps to world Y in decreasing order. Prefer a
+    lateral waypoint over a vertical one and positive world Y when both sides
+    are equally clear. Randomly choosing among symmetric solutions gives an
+    MSE-trained policy contradictory labels whose average points at the
+    obstacle.
+    """
+    center = np.array(arr.shape) // 2
+    zero_indices = np.argwhere(arr == 0)
     if len(zero_indices) == 0:
-        return None  # if no zero elements, return None
-    dist_to_zeros = dist_to_center[tuple(zero_indices.T)]  # get distances to center for zero elements
-    min_dist_indices = np.argwhere(dist_to_zeros == dist_to_zeros.min()).flatten()  # find indices of zero elements with minimum distance to center
-    chosen_index = np.random.choice(min_dist_indices)  # randomly choose one of the zero elements with minimum distance to center
-    return tuple(zero_indices[chosen_index])  # return index tuple
+        return None
+
+    offsets = zero_indices - center
+    distances = np.abs(offsets).sum(axis=1)
+    candidates = zero_indices[distances == distances.min()]
+
+    def waypoint_rank(index):
+        vertical_offset, lateral_offset = index - center
+        return (
+            abs(vertical_offset),
+            0 if lateral_offset < 0 else 1,
+            abs(lateral_offset),
+            0 if vertical_offset < 0 else 1,
+            tuple(index),
+        )
+
+    return tuple(min(candidates, key=waypoint_rank))
 
 def compute_command_state_based(state, obstacles, desiredVel, rl_policy=None, keyboard=False, keyboard_input=''):
     # print("Computing command based on obstacle information!")

@@ -8,7 +8,9 @@
 quadrotor obstacle avoidance" by Bhattacharya, et. al
 """
 
+import glob
 import os, sys
+import random
 from os.path import join as opj
 import numpy as np
 import torch
@@ -41,6 +43,15 @@ class TRAINER:
             self.datadir = args.datadir
             self.ws_suffix = args.ws_suffix
             self.dataset_name = args.dataset
+            self.extra_dataset_name = args.extra_dataset
+            self.extra_dataset_names = [name.strip() for name in args.extra_dataset.split(',') if name.strip()]
+            repeat_values = [int(value.strip()) for value in str(args.extra_dataset_repeats).split(',')]
+            if len(repeat_values) == 1:
+                repeat_values *= len(self.extra_dataset_names)
+            if len(repeat_values) != len(self.extra_dataset_names):
+                raise ValueError('--extra_dataset_repeats must contain one value or one value per extra dataset')
+            self.extra_dataset_repeats = repeat_values
+            self.extra_horizontal_flip = args.extra_horizontal_flip
             self.short = args.short
 
             self.model_type = args.model_type
@@ -54,6 +65,15 @@ class TRAINER:
             self.lr_decay = args.lr_decay
             self.save_model_freq = args.save_model_freq
             self.val_freq = args.val_freq
+            self.avoidance_loss_weight = args.avoidance_loss_weight
+            self.toward_wall_loss_weight = args.toward_wall_loss_weight
+
+            if self.seed is not None:
+                random.seed(self.seed)
+                np.random.seed(self.seed)
+                torch.manual_seed(self.seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(self.seed)
 
         else:
             raise Exception("Args are not provided")
@@ -106,12 +126,23 @@ class TRAINER:
         else:    
             train_val_dirs = None
 
+        if train_val_dirs is None and self.extra_dataset_name:
+            train_val_dirs = self.mixed_train_val_dirs()
+
         self.dataloader(val_split=self.val_split, short=self.short, seed=self.seed, train_val_dirs=train_val_dirs)
 
         # TODO hardcoding num_training_steps to be the number of trajectories instead of number of images
         self.num_training_steps = self.train_trajlength.shape[0]
         self.num_val_steps = self.val_trajlength.shape[0]
         self.lr_warmup_iters = self.lr_warmup_epochs * self.num_training_steps
+        extra_dataset_dirs = {
+            os.path.abspath(opj(self.basedir, self.datadir, name))
+            for name in self.extra_dataset_names
+        }
+        self.train_is_extra = np.array([
+            any(os.path.commonpath((os.path.abspath(path), extra_dir)) == extra_dir for extra_dir in extra_dataset_dirs)
+            for path in self.train_dirs
+        ])
 
         ##################################
         ## Define network and optimizer ##
@@ -139,6 +170,38 @@ class TRAINER:
             self.load_from_checkpoint(self.checkpoint_path)
 
         self.total_its = self.num_eps_trained * self.num_training_steps
+
+    def mixed_train_val_dirs(self):
+        rng = random.Random(self.seed)
+
+        def split_dataset(path):
+            folders = sorted(folder for folder in glob.glob(opj(path, '*')) if os.path.isdir(folder))
+            if not folders:
+                raise RuntimeError(f'No trajectories found in {path}')
+            rng.shuffle(folders)
+            num_val = int(self.val_split * len(folders))
+            if self.val_split > 0 and len(folders) > 1:
+                num_val = max(1, num_val)
+            return folders[num_val:], folders[:num_val]
+
+        base_train, base_val = split_dataset(opj(self.basedir, self.dataset_dir))
+        train_dirs = list(base_train)
+        val_dirs = list(base_val)
+        extra_summary = []
+        for name, repeats in zip(self.extra_dataset_names, self.extra_dataset_repeats):
+            extra_dir = opj(self.basedir, self.datadir, name)
+            extra_train, extra_val = split_dataset(extra_dir)
+            train_dirs += extra_train * repeats
+            val_dirs += extra_val
+            extra_summary.append(f'{len(extra_train)} {name} x{repeats}')
+        rng.shuffle(train_dirs)
+
+        self.mylogger(
+            f'[DATALOADER] Mixed split: {len(base_train)} base + '
+            f'{" + ".join(extra_summary)} training trajectories; '
+            f'{len(base_val)} base + {len(val_dirs) - len(base_val)} unique extra validation trajectories'
+        )
+        return train_dirs, val_dirs
 
     def mylogger(self, msg):
         print(msg)
@@ -192,6 +255,29 @@ class TRAINER:
     def weighted_mse_loss(self, input, target, weight):
         return torch.mean(weight * (input - target) ** 2)
 
+    def command_loss(self, prediction, target):
+        if self.avoidance_loss_weight <= 0:
+            return F.mse_loss(prediction, target)
+
+        # Most frames command straight flight. Without this weighting their
+        # forward-velocity error overwhelms each short avoidance maneuver.
+        component_weight = torch.ones_like(target)
+        avoidance_strength = torch.clamp(target[:, 1:].abs() / 0.15, max=1.0)
+        component_weight[:, 1:] += self.avoidance_loss_weight * avoidance_strength
+        loss = self.weighted_mse_loss(prediction, target, component_weight)
+
+        # A wrong-sign lateral/vertical command is qualitatively worse than a
+        # weak correct command: it steers into the obstacle. Penalize only
+        # components with a meaningful avoidance label.
+        if self.toward_wall_loss_weight > 0:
+            avoidance_mask = target[:, 1:].abs() >= 0.15
+            toward_component = torch.relu(-prediction[:, 1:] * torch.sign(target[:, 1:]))
+            if avoidance_mask.any():
+                loss += self.toward_wall_loss_weight * torch.mean(
+                    toward_component[avoidance_mask] ** 2
+                )
+        return loss
+
 
     def train(self):
 
@@ -220,6 +306,7 @@ class TRAINER:
             shuffled_traj_indices = np.random.permutation(len(self.train_traj_starts))
             train_traj_starts = self.train_traj_starts[shuffled_traj_indices]
             train_traj_lengths = self.train_trajlength[shuffled_traj_indices]
+            train_is_extra = self.train_is_extra[shuffled_traj_indices]
 
             ### Training loop ###
             self.model.train()
@@ -228,11 +315,18 @@ class TRAINER:
                 traj_input = self.train_ims[train_traj_starts[it]+1 : train_traj_starts[it]+train_traj_lengths[it], :, :].unsqueeze(1) #1, traj, 
                 desvel = self.train_desvel[train_traj_starts[it]+1 : train_traj_starts[it]+train_traj_lengths[it]].view(-1, 1)
                 currquat = self.train_currquat[train_traj_starts[it]+1 : train_traj_starts[it]+train_traj_lengths[it]]
-                pred, _ = self.model([traj_input, desvel, currquat]) #, (init_hidden_state, init_cell_state)])
                 cmd = self.train_velcmd[train_traj_starts[it]+1 : train_traj_starts[it]+train_traj_lengths[it], :]
                 cmd_norm = cmd / desvel # normalize each row by each desvel element
-                cmd_norm = cmd_norm
-                loss = F.mse_loss(cmd_norm, pred)
+
+                if self.extra_horizontal_flip and train_is_extra[it] and np.random.random() < 0.5:
+                    traj_input = torch.flip(traj_input, dims=(-1,))
+                    currquat = currquat.clone()
+                    currquat[:, (1, 3)] *= -1
+                    cmd_norm = cmd_norm.clone()
+                    cmd_norm[:, 1] *= -1
+
+                pred, _ = self.model([traj_input, desvel, currquat]) #, (init_hidden_state, init_cell_state)])
+                loss = self.command_loss(pred, cmd_norm)
                 ep_loss += loss
                 loss.backward()
                 gradnorm += torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=torch.inf)
@@ -308,6 +402,9 @@ def argparsing():
     parser.add_argument('--ws_suffix', type=str, default='', help='suffix if any to workspace name')
     parser.add_argument('--model_type', type=str, default='LSTMNet', help='string matching model name in lstmArch.py')
     parser.add_argument('--dataset', type=str, default='5-2', help='name of dataset')
+    parser.add_argument('--extra_dataset', type=str, default='', help='additional dataset mixed into training only with optional repetition')
+    parser.add_argument('--extra_dataset_repeats', type=str, default='1', help='one repeat count or comma-separated counts matching extra_dataset')
+    parser.add_argument('--extra_horizontal_flip', action='store_true', default=False, help='randomly mirror extra-dataset trajectories and their lateral labels')
     parser.add_argument('--short', type=int, default=0, help='if nonzero, how many trajectory folders to load')
     parser.add_argument('--val_split', type=float, default=0.2, help='fraction of dataset to use for validation')
     parser.add_argument('--seed', type=int, default=None, help='random seed to use for python random, numpy, and torch -- WARNING, probably not fully implemented')
@@ -320,6 +417,8 @@ def argparsing():
     parser.add_argument('--lr_decay', action='store_true', default=False, help='whether to use lr_decay, hardcoded to exponentially decay to 0.01 * lr by end of training')
     parser.add_argument('--save_model_freq', type=int, default=25, help='frequency with which to save model checkpoints')
     parser.add_argument('--val_freq', type=int, default=10, help='frequency with which to evaluate on validation set')
+    parser.add_argument('--avoidance_loss_weight', type=float, default=0.0, help='extra training weight for labeled lateral and vertical avoidance commands')
+    parser.add_argument('--toward_wall_loss_weight', type=float, default=0.0, help='extra hinge penalty for avoidance predictions with the wrong sign')
 
     args = parser.parse_args()
     print(f'[CONFIGARGPARSE] Parsing args from config file {args.config}')

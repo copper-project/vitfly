@@ -22,12 +22,17 @@ def dataloader(data_dir, val_split=0., short=0, seed=None, train_val_dirs=None):
     cropWidth = 90
 
     if train_val_dirs is not None:
-        traj_folders = train_val_dirs[0] + train_val_dirs[1]
-        val_split = len(train_val_dirs[1]) / len(traj_folders)
+        train_folders = list(train_val_dirs[0])
+        val_folders = list(train_val_dirs[1])
+        # Validation trajectories must come first because the split below uses
+        # the first num_val_trajs loaded sequences as validation data.
+        traj_folders = val_folders + train_folders
+        explicit_val_folders = set(val_folders)
     else:
         traj_folders = sorted(glob.glob(opj(data_dir, '*')))
         random.seed(seed)
         random.shuffle(traj_folders)
+        explicit_val_folders = None
 
     if short > 0:
         assert short <= len(traj_folders), f"short={short} is greater than the number of folders={len(traj_folders)}"
@@ -43,6 +48,8 @@ def dataloader(data_dir, val_split=0., short=0, seed=None, train_val_dirs=None):
     skippedFolders = 0
     collisionImages = 0
     collisionFolders = 0
+    loaded_explicit_val_trajs = 0
+    loaded_traj_folders = []
 
     for i, traj_folder in enumerate(traj_folders):
         if len(traj_folders)//10 > 0 and i % (len(traj_folders)//10) == 0:
@@ -101,6 +108,9 @@ def dataloader(data_dir, val_split=0., short=0, seed=None, train_val_dirs=None):
         try:
             traj_ims_full.append(traj_ims)
             traj_meta_full.append(traj_meta)
+            loaded_traj_folders.append(traj_folder)
+            if explicit_val_folders is not None and traj_folder in explicit_val_folders:
+                loaded_explicit_val_trajs += 1
         except:
             print(f'[DATALOADER] {traj_ims.shape}')
             print(f"[DATALOADER] Suspected empty image, folder {os.path.basename(traj_folder)}")
@@ -146,7 +156,11 @@ def dataloader(data_dir, val_split=0., short=0, seed=None, train_val_dirs=None):
     traj_meta[:, 19] = (traj_meta[:, 19] - stats_ctbr[3, 0]) / (2 * stats_ctbr[3, 1])
 
     # make train-val split (relies on earlier shuffle of traj_folders to randomize selection)
-    num_val_trajs = int(val_split * len(traj_lengths))
+    num_val_trajs = (
+        loaded_explicit_val_trajs
+        if explicit_val_folders is not None
+        else int(val_split * len(traj_lengths))
+    )
     val_idx = np.sum(traj_lengths[:num_val_trajs], dtype=np.int32)
     traj_meta_val = traj_meta_full[:val_idx]
     traj_meta_train = traj_meta_full[val_idx:]
@@ -165,7 +179,7 @@ def dataloader(data_dir, val_split=0., short=0, seed=None, train_val_dirs=None):
 
     # Note, we return the is_png=1 flag since it indicates old vs new datasets, which indicates how to parse the metadata
     # We also return the traj_folder names for train and val sets, so that they can be saved and later used to specifically generate evaluate plots on each set
-    return (traj_meta_train, traj_ims_train, traj_lengths_train, desired_vels_train, curr_quats_train, curr_ctbr_train), (traj_meta_val, traj_ims_val, traj_lengths_val, desired_vels_val, curr_quats_val, curr_ctbr_val), 1, (traj_folders[num_val_trajs:], traj_folders[:num_val_trajs])
+    return (traj_meta_train, traj_ims_train, traj_lengths_train, desired_vels_train, curr_quats_train, curr_ctbr_train), (traj_meta_val, traj_ims_val, traj_lengths_val, desired_vels_val, curr_quats_val, curr_ctbr_val), 1, (loaded_traj_folders[num_val_trajs:], loaded_traj_folders[:num_val_trajs])
 
 def parse_meta_str(meta_str):
 

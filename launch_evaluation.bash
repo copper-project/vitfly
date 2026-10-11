@@ -38,16 +38,30 @@ else
   exit 1
 fi
 
+env_config_arg=()
+if [ -n "${3:-}" ] && [ "$3" != "human" ]
+then
+  env_config_arg=("env_config:=$3")
+fi
+
+model_path="${4:-models/ViTLSTM_model.pth}"
+if [[ "$model_path" != /* ]]
+then
+  model_path="$PWD/$model_path"
+fi
+
 # Set Flightmare Path if it is not set
 if [ -z $FLIGHTMARE_PATH ]
 then
   export FLIGHTMARE_PATH=$PWD/flightmare
 fi
 
+rviz="${VITFLY_RVIZ:-True}"
+
 # Launch the simulator, unless it is already running
 if [ -z $(pgrep visionsim_node) ]
 then
-  roslaunch envsim visionenv_sim.launch render:=True gui:=False rviz:=True $realtimefactor &
+  roslaunch envsim visionenv_sim.launch render:=True gui:=False rviz:=$rviz $realtimefactor "${env_config_arg[@]}" &
   ROS_PID="$!"
   echo $ROS_PID
   sleep 10
@@ -86,7 +100,7 @@ do
     # Launch the simulator, unless it is already running
     if [ -z $(pgrep visionsim_node) ]
     then
-      roslaunch envsim visionenv_sim.launch render:=True gui:=False rviz:=True $realtimefactor &
+      roslaunch envsim visionenv_sim.launch render:=True gui:=False rviz:=$rviz $realtimefactor "${env_config_arg[@]}" &
       ROS_PID="$!"
       echo $ROS_PID
       sleep 10
@@ -112,7 +126,7 @@ do
   python3 evaluation_node.py ${datetime}_N$i &
   PY_PID="$!"
 
-  python3 run_competition.py $run_competition_args --des_vel 5.0 --model_type "ViTLSTM" --model_path ../../models/ViTLSTM_model.pth &
+  python3 run_competition.py $run_competition_args --des_vel 5.0 --model_type "ViTLSTM" --model_path "$model_path" &
   COMP_PID="$!"
 
   cd -
@@ -151,9 +165,11 @@ do
   mv "tmp.yaml" "$SUMMARY_FILE"
 
   kill -SIGINT "$COMP_PID"
+  wait "$COMP_PID" || true
 done
 
 if [ $ROS_PID ]
 then
   kill -SIGINT "$ROS_PID"
+  wait "$ROS_PID" || true
 fi
